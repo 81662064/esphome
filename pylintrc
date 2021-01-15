@@ -8,6 +8,7 @@ disable=
   unused-argument,
   global-statement,
   too-few-public-methods,
+  too-many-lines,
   too-many-locals,
   too-many-ancestors,
   too-many-branches,
@@ -22,9 +23,8 @@ disable=
   undefined-loop-variable,
   useless-object-inheritance,
   stop-iteration-return,
-
-
-additional-builtins=
-  unicode,
-  long,
-  raw_input
+  no-self-use,
+  import-outside-toplevel,
+  # Broken
+  unsupported-membership-test,
+  unsubscriptable-object,

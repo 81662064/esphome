@@ -1,6 +1,7 @@
-FROM python:2.7
+FROM esphome/esphome-lint-base:2.6.0
 
-COPY requirements.txt /requirements.txt
+COPY requirements.txt requirements_test.txt /
+RUN pip3 install --no-cache-dir -r /requirements.txt -r /requirements_test.txt
 
-RUN pip install -r /requirements.txt && \
-    pip install flake8==3.6.0 pylint==1.9.4 pillow
+VOLUME ["/esphome"]
+WORKDIR /esphome

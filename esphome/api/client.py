@@ -14,7 +14,6 @@ import esphome.api.api_pb2 as pb
 from esphome.const import CONF_PASSWORD, CONF_PORT
 from esphome.core import EsphomeError
 from esphome.helpers import resolve_ip_address, indent, color
-from esphome.py_compat import text_type, IS_PY2, byte_to_bytes, char_to_byte, format_bytes
 from esphome.util import safe_print
 
 _LOGGER = logging.getLogger(__name__)
@@ -67,16 +66,16 @@ MESSAGE_TYPE_TO_PROTO = {
 
 def _varuint_to_bytes(value):
     if value <= 0x7F:
-        return byte_to_bytes(value)
+        return bytes([value])
 
     ret = bytes()
     while value:
         temp = value & 0x7F
         value >>= 7
         if value:
-            ret += byte_to_bytes(temp | 0x80)
+            ret += bytes([temp | 0x80])
         else:
-            ret += byte_to_bytes(temp)
+            ret += bytes([temp])
 
     return ret
 
@@ -84,8 +83,7 @@ def _varuint_to_bytes(value):
 def _bytes_to_varuint(value):
     result = 0
     bitpos = 0
-    for c in value:
-        val = char_to_byte(c)
+    for val in value:
         result |= (val & 0x7F) << bitpos
         bitpos += 7
         if (val & 0x80) == 0:
@@ -108,7 +106,6 @@ class APIClient(threading.Thread):
         self._message_handlers = []
         self._keepalive = 5
         self._ping_timer = None
-        self._refresh_ping()
 
         self.on_disconnect = None
         self.on_connect = None
@@ -132,8 +129,8 @@ class APIClient(threading.Thread):
             if self._connected:
                 try:
                     self.ping()
-                except APIConnectionError:
-                    self._fatal_error()
+                except APIConnectionError as err:
+                    self._fatal_error(err)
                 else:
                     self._refresh_ping()
 
@@ -175,7 +172,7 @@ class APIClient(threading.Thread):
             raise APIConnectionError("You need to call start() first!")
 
         if self._connected:
-            raise APIConnectionError("Already connected!")
+            self.disconnect(on_disconnect=False)
 
         try:
             ip = resolve_ip_address(self._address)
@@ -184,7 +181,7 @@ class APIClient(threading.Thread):
                             self._address)
             _LOGGER.warning("(If this error persists, please set a static IP address: "
                             "https://esphome.io/components/wifi.html#manual-ips)")
-            raise APIConnectionError(err)
+            raise APIConnectionError(err) from err
 
         _LOGGER.info("Connecting to %s:%s (%s)", self._address, self._port, ip)
         self._socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -192,30 +189,33 @@ class APIClient(threading.Thread):
         self._socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         try:
             self._socket.connect((ip, self._port))
-        except socket.error as err:
-            self._fatal_error()
-            raise APIConnectionError("Error connecting to {}: {}".format(ip, err))
+        except OSError as err:
+            err = APIConnectionError(f"Error connecting to {ip}: {err}")
+            self._fatal_error(err)
+            raise err
         self._socket.settimeout(0.1)
 
         self._socket_open_event.set()
 
         hello = pb.HelloRequest()
-        hello.client_info = 'ESPHome v{}'.format(const.__version__)
+        hello.client_info = f'ESPHome v{const.__version__}'
         try:
             resp = self._send_message_await_response(hello, pb.HelloResponse)
         except APIConnectionError as err:
-            self._fatal_error()
+            self._fatal_error(err)
             raise err
         _LOGGER.debug("Successfully connected to %s ('%s' API=%s.%s)", self._address,
                       resp.server_info, resp.api_version_major, resp.api_version_minor)
         self._connected = True
+        self._refresh_ping()
         if self.on_connect is not None:
             self.on_connect()
 
     def _check_connected(self):
         if not self._connected:
-            self._fatal_error()
-            raise APIConnectionError("Must be connected!")
+            err = APIConnectionError("Must be connected!")
+            self._fatal_error(err)
+            raise err
 
     def login(self):
         self._check_connected()
@@ -233,25 +233,26 @@ class APIClient(threading.Thread):
         if self.on_login is not None:
             self.on_login()
 
-    def _fatal_error(self):
+    def _fatal_error(self, err):
         was_connected = self._connected
 
         self._close_socket()
 
         if was_connected and self.on_disconnect is not None:
-            self.on_disconnect()
+            self.on_disconnect(err)
 
     def _write(self, data):  # type: (bytes) -> None
         if self._socket is None:
             raise APIConnectionError("Socket closed")
 
-        _LOGGER.debug("Write: %s", format_bytes(data))
+        # _LOGGER.debug("Write: %s", format_bytes(data))
         with self._socket_write_lock:
             try:
                 self._socket.sendall(data)
-            except socket.error as err:
-                self._fatal_error()
-                raise APIConnectionError("Error while writing data: {}".format(err))
+            except OSError as err:
+                err = APIConnectionError(f"Error while writing data: {err}")
+                self._fatal_error(err)
+                raise err
 
     def _send_message(self, msg):
         # type: (message.Message) -> None
@@ -262,18 +263,14 @@ class APIClient(threading.Thread):
             raise ValueError
 
         encoded = msg.SerializeToString()
-        _LOGGER.debug("Sending %s:\n%s", type(msg), indent(text_type(msg)))
-        if IS_PY2:
-            req = chr(0x00)
-        else:
-            req = bytes([0])
+        _LOGGER.debug("Sending %s:\n%s", type(msg), indent(str(msg)))
+        req = bytes([0])
         req += _varuint_to_bytes(len(encoded))
         req += _varuint_to_bytes(message_type)
         req += encoded
         self._write(req)
-        self._refresh_ping()
 
-    def _send_message_await_response_complex(self, send_msg, do_append, do_stop, timeout=1):
+    def _send_message_await_response_complex(self, send_msg, do_append, do_stop, timeout=5):
         event = threading.Event()
         responses = []
 
@@ -294,7 +291,7 @@ class APIClient(threading.Thread):
             raise APIConnectionError("Timeout while waiting for message response!")
         return responses
 
-    def _send_message_await_response(self, send_msg, response_type, timeout=1):
+    def _send_message_await_response(self, send_msg, response_type, timeout=5):
         def is_response(msg):
             return isinstance(msg, response_type)
 
@@ -309,7 +306,7 @@ class APIClient(threading.Thread):
         self._check_connected()
         return self._send_message_await_response(pb.PingRequest(), pb.PingResponse)
 
-    def disconnect(self):
+    def disconnect(self, on_disconnect=True):
         self._check_connected()
 
         try:
@@ -318,14 +315,14 @@ class APIClient(threading.Thread):
             pass
         self._close_socket()
 
-        if self.on_disconnect is not None:
-            self.on_disconnect()
+        if self.on_disconnect is not None and on_disconnect:
+            self.on_disconnect(None)
 
     def _check_authenticated(self):
         if not self._authenticated:
             raise APIConnectionError("Must login first!")
 
-    def subscribe_logs(self, on_log, log_level=None, dump_config=False):
+    def subscribe_logs(self, on_log, log_level=7, dump_config=False):
         self._check_authenticated()
 
         def on_msg(msg):
@@ -334,8 +331,7 @@ class APIClient(threading.Thread):
 
         self._message_handlers.append(on_msg)
         req = pb.SubscribeLogsRequest(dump_config=dump_config)
-        if log_level is not None:
-            req.level = log_level
+        req.level = log_level
         self._send_message(req)
 
     def _recv(self, amount):
@@ -350,18 +346,18 @@ class APIClient(threading.Thread):
                 raise APIConnectionError("No socket!")
             try:
                 val = self._socket.recv(amount - len(ret))
-            except AttributeError:
-                raise APIConnectionError("Socket was closed")
+            except AttributeError as err:
+                raise APIConnectionError("Socket was closed") from err
             except socket.timeout:
                 continue
-            except socket.error as err:
-                raise APIConnectionError("Error while receiving data: {}".format(err))
+            except OSError as err:
+                raise APIConnectionError(f"Error while receiving data: {err}") from err
             ret += val
         return ret
 
     def _recv_varint(self):
         raw = bytes()
-        while not raw or char_to_byte(raw[-1]) & 0x80:
+        while not raw or raw[-1] & 0x80:
             raw += self._recv(1)
         return _bytes_to_varuint(raw)
 
@@ -370,7 +366,7 @@ class APIClient(threading.Thread):
             return
 
         # Preamble
-        if char_to_byte(self._recv(1)[0]) != 0x00:
+        if self._recv(1)[0] != 0x00:
             raise APIConnectionError("Invalid preamble")
 
         length = self._recv_varint()
@@ -387,7 +383,6 @@ class APIClient(threading.Thread):
         for msg_handler in self._message_handlers[:]:
             msg_handler(msg)
         self._handle_internal_messages(msg)
-        self._refresh_ping()
 
     def run(self):
         self._running_event.set()
@@ -399,7 +394,7 @@ class APIClient(threading.Thread):
                     break
                 if self._connected:
                     _LOGGER.error("Error while reading incoming messages: %s", err)
-                    self._fatal_error()
+                    self._fatal_error(err)
         self._running_event.clear()
 
     def _handle_internal_messages(self, msg):
@@ -410,7 +405,7 @@ class APIClient(threading.Thread):
                 self._socket = None
             self._connected = False
             if self.on_disconnect is not None:
-                self.on_disconnect()
+                self.on_disconnect(None)
         elif isinstance(msg, pb.PingRequest):
             self._send_message(pb.PingResponse())
         elif isinstance(msg, pb.GetTimeRequest):
@@ -431,12 +426,12 @@ def run_logs(config, address):
 
     has_connects = []
 
-    def try_connect(tries=0, is_disconnect=True):
+    def try_connect(err, tries=0):
         if stopping:
             return
 
-        if is_disconnect:
-            _LOGGER.warning(u"Disconnected from API.")
+        if err:
+            _LOGGER.warning("Disconnected from API: %s", err)
 
         while retry_timer:
             retry_timer.pop(0).cancel()
@@ -445,27 +440,27 @@ def run_logs(config, address):
         try:
             cli.connect()
             cli.login()
-        except APIConnectionError as err:  # noqa
-            error = err
+        except APIConnectionError as err2:  # noqa
+            error = err2
 
         if error is None:
             _LOGGER.info("Successfully connected to %s", address)
             return
 
-        wait_time = min(2**tries, 300)
+        wait_time = int(min(1.5**min(tries, 100), 30))
         if not has_connects:
-            _LOGGER.warning(u"Initial connection failed. The ESP might not be connected "
-                            u"to WiFi yet (%s). Re-Trying in %s seconds",
+            _LOGGER.warning("Initial connection failed. The ESP might not be connected "
+                            "to WiFi yet (%s). Re-Trying in %s seconds",
                             error, wait_time)
         else:
-            _LOGGER.warning(u"Couldn't connect to API (%s). Trying to reconnect in %s seconds",
+            _LOGGER.warning("Couldn't connect to API (%s). Trying to reconnect in %s seconds",
                             error, wait_time)
-        timer = threading.Timer(wait_time, functools.partial(try_connect, tries + 1, is_disconnect))
+        timer = threading.Timer(wait_time, functools.partial(try_connect, None, tries + 1))
         timer.start()
         retry_timer.append(timer)
 
     def on_log(msg):
-        time_ = datetime.now().time().strftime(u'[%H:%M:%S]')
+        time_ = datetime.now().time().strftime('[%H:%M:%S]')
         text = msg.message
         if msg.send_failed:
             text = color('white', '(Message skipped because it was too big to fit in '
@@ -484,7 +479,7 @@ def run_logs(config, address):
     cli.start()
 
     try:
-        try_connect(is_disconnect=False)
+        try_connect(None)
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
